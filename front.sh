@@ -43,12 +43,12 @@ msg() {
     -verd) cor="${COLOR[2]}${NEGRITO}" && echo -e "${cor}${2}${SEMCOR}" ;;
     -bra) cor="${COLOR[0]}${SEMCOR}" && echo -e "${cor}${2}${SEMCOR}" ;;
     -bar)
-
+      
       WIDTH=55
       echo -e "${COLOR[4]}$(printf '%.0s━' $(seq 1 $WIDTH))${SEMCOR}"
     ;;
     -bar1)
-
+      
       WIDTH=55
       echo -e "${COLOR[4]}$(printf '%.0s━' $(seq 1 $WIDTH))${SEMCOR}"
     ;;
@@ -56,16 +56,16 @@ msg() {
       echo -e "${COLOR[4]}=====================================================${SEMCOR}"
     ;;
     -bar3)
-
+      
       WIDTH=55
       echo -e "${COLOR[4]}$(printf '%.0s━' $(seq 1 $WIDTH))${SEMCOR}"
     ;;
     -bar4)
-
+      
       echo -e "${COLOR[5]}•••••••••••••••••••••••••••••••••••••••••••••••••${SEMCOR}"
     ;;
     -bar5)
-
+      
       WIDTH=55
       echo -e "${COLOR[4]}$(printf '%.0s━' $(seq 1 $WIDTH))${SEMCOR}"
     ;;
@@ -88,75 +88,48 @@ if [ ! -x "$SCRIPT_PATH" ]; then
     sudo chmod +x "$SCRIPT_PATH"
 fi
 
-# ================= FUNCIONES NUCLEO =================
+# Función para eliminar usuarios expirados automáticamente
+check_expired_users() {
+  if [ ! -f /etc/nginx/user_data.txt ]; then
+    return
+  fi
 
-# Agrega un usuario a nginx.conf y al archivo de datos sin interacción
-_add_user_to_config() {
-    local user_name="$1"
-    local ip="$2"
-    local days="$3"
+  local current_time=$(date +%s)
+  local removed=0
+  local temp_file=$(mktemp)
 
-    # Validar que no exista ya
-    if grep -q "^${user_name}:" "/etc/nginx/user_data.txt"; then
-        msg -verm "El usuario ${user_name} ya existe. No se agregó."
-        return 1
+  # Leer el archivo línea por línea
+  while IFS=: read -r user_name ip expiration_date; do
+    if [ $expiration_date -lt $current_time ]; then
+      # Usuario expirado: eliminarlo
+      msg -verm "Eliminando usuario expirado: $user_name"
+      # Eliminar bloque location del nginx.conf
+      sudo sed -i "/location \/${user_name} {/,/}/d" /etc/nginx/nginx.conf
+      removed=$((removed + 1))
+    else
+      # Conservar usuario no expirado
+      echo "${user_name}:${ip}:${expiration_date}" >> "$temp_file"
     fi
+  done < /etc/nginx/user_data.txt
 
-    local block=$(cat <<EOF
-    location /${user_name} {
-        proxy_pass http://${ip}:80;
-    }
-EOF
-)
-    echo "$block" | sudo sed -i "/server {/,/}/ { 
-      /}/ r /dev/stdin
-    }" /etc/nginx/nginx.conf
-
-    local now=$(date +%s)
-    local expiration_date=$((now + (days * 86400)))
-    echo "${user_name}:${ip}:${expiration_date}" >> /etc/nginx/user_data.txt
-
-    msg -verd "Usuario ${user_name} añadido (expira en ${days} días)."
-    return 0
-}
-
-# Elimina un usuario por nombre (de nginx.conf y del archivo)
-_remove_user_by_name() {
-    local user_name="$1"
-    # Eliminar bloque location de nginx.conf
-    sudo sed -i "/location \/${user_name} {/,/}/d" /etc/nginx/nginx.conf
-    # Eliminar línea del archivo de datos
-    sed -i "/^${user_name}:/d" /etc/nginx/user_data.txt
-    msg -verd "Usuario ${user_name} eliminado."
-}
-
-# Verifica y elimina automáticamente usuarios expirados
-check_and_remove_expired_users() {
-    if [ ! -f /etc/nginx/user_data.txt ]; then
-        return
+  # Reemplazar el archivo original si hubo cambios
+  if [ $removed -gt 0 ]; then
+    mv "$temp_file" /etc/nginx/user_data.txt
+    # Reiniciar nginx si hay cambios y la configuración es válida
+    if sudo nginx -t > /dev/null 2>&1; then
+      sudo systemctl restart nginx
+      msg -verd "Nginx reiniciado después de eliminar $removed usuario(s) expirado(s)."
+    else
+      msg -verm "Error en configuración de Nginx después de eliminar expirados."
     fi
-    local current_time=$(date +%s)
-    local removed=0
-    while IFS=: read -r user_name ip expiration_date; do
-        if [ $current_time -ge $expiration_date ]; then
-            _remove_user_by_name "$user_name"
-            ((removed++))
-        fi
-    done < /etc/nginx/user_data.txt
-    if [ $removed -gt 0 ]; then
-        msg -ama "Se eliminaron ${removed} usuario(s) expirado(s)."
-        # Recargar nginx si hubo cambios
-        if sudo nginx -t > /dev/null 2>&1; then
-            sudo systemctl restart nginx
-        fi
-    fi
+  else
+    rm -f "$temp_file"
+  fi
 }
-
-# ================= FUNCIONES ORIGINALES (MODIFICADAS) =================
 
 install_and_configure_nginx() {
   sudo apt install nginx -y
-
+  
   echo "user www-data;
 worker_processes auto;
 pid /run/nginx.pid;
@@ -190,7 +163,7 @@ http {
 
     }
 }" | sudo tee /etc/nginx/nginx.conf > /dev/null
-
+  
   if sudo nginx -t > /dev/null 2>&1; then
         sudo systemctl restart nginx
         msg -verd "Nginx reiniciado con éxito."
@@ -233,7 +206,22 @@ add_user() {
         fi
     done
 
-    _add_user_to_config "$user_name" "$ip" "$days"
+    local block=$(cat <<EOF
+    location /${user_name} {
+        proxy_pass http://${ip}:80;
+    }
+EOF
+)
+    echo "$block" | sudo sed -i "/server {/,/}/ { 
+      /}/ r /dev/stdin
+    }" /etc/nginx/nginx.conf
+
+
+    local now=$(date +%s)
+    local expiration_date=$((now + (days * 86400)))
+    echo "${user_name}:${ip}:${expiration_date}" >> /etc/nginx/user_data.txt
+
+    msg -verd "USUARIO ${user_name} añadida a nginx.conf con expiración en ${days} días."
 
     if sudo nginx -t > /dev/null 2>&1; then
         sudo systemctl restart nginx
@@ -252,42 +240,43 @@ show_users() {
     return
   fi
 
-  msg -verd "USUARIOS REGISTRADOS:"
+  # Primero eliminar expirados antes de mostrar
+  check_expired_users
+
+  if [ ! -s /etc/nginx/user_data.txt ]; then
+    msg -verm "NO HAY USUARIOS ACTIVOS (todos expirados o ninguno registrado)."
+    return
+  fi
+
+  msg -verd "USUARIOS ACTIVOS:"
   echo -e "\e[1;36m==================================================\e[0m"
   echo -e "\e[1;36m  Nombre          IP             Expiración\e[0m"
   echo -e "\e[1;36m==================================================\e[0m"
 
   local current_time=$(date +%s)
   local count=1
-  local active_count=0
-  local expired_count=0
 
   while IFS=: read -r user_name ip expiration_date; do
     local days_left=$(( (expiration_date - current_time) / 86400 ))
-
+    # Ya no hay expirados porque se eliminaron, pero por seguridad
     if [ $days_left -ge 0 ]; then
-      local status_color="\e[1;32m"
-      local status="[+$days_left días]"
-      ((active_count++))
-    else
-      local status_color="\e[1;31m"
-      local status="[Expirado]"
-      ((expired_count++))
+      printf "%b[%s]%b%-15s %-15s +%s días\e[0m\n" "\e[1;36m" "$count" "\e[1;32m" "$user_name" "$ip" "$days_left"
     fi
-
-    printf "%b[%s]%b%-15s %-15s %s\n\e[0m" "\e[1;36m" "$count" "$status_color" "$user_name" "$ip" "$status"
     ((count++))
   done < /etc/nginx/user_data.txt
 
   echo -e "\e[1;36m==================================================\e[0m"
-  echo -e "Usuarios activos: [\e[1;32m${active_count}\e[0m]"
-  echo -e "Usuarios expirados: [\e[1;31m${expired_count}\e[0m]"
 }
 
 remove_user() {
   clear
-  msg -verd "⚠️ ADVERTENCIA: LOS USUARIOS EXPIRADOS SE RECOMIENDA ELIMINARLOS MANUALMENTE CON EL NÚMERO ⚠️"
-  show_users
+  msg -verd "⚠️ ELIMINAR USUARIO MANUALMENTE ⚠️"
+  show_users  # Esto ya llama a check_expired_users internamente
+
+  if [ ! -s /etc/nginx/user_data.txt ]; then
+    msg -verm "No hay usuarios activos para eliminar."
+    return
+  fi
 
   while true; do
     read -p "Introduce el número del usuario que deseas eliminar: " user_number
@@ -297,15 +286,21 @@ remove_user() {
     fi
 
     if [[ "$user_number" =~ ^[0-9]+$ ]]; then
-      # Obtener lista de nombres ordenados igual que en show_users
-      local names=()
+      # Obtener lista de usuarios desde user_data.txt (activos)
+      local users_list=()
       while IFS=: read -r name ip exp; do
-        names+=("$name")
+        users_list+=("$name")
       done < /etc/nginx/user_data.txt
-      local user_count=${#names[@]}
+      local user_count=${#users_list[@]}
+      
       if [ "$user_number" -gt 0 ] && [ "$user_number" -le "$user_count" ]; then
-        local user_to_remove="${names[$((user_number-1))]}"
-        _remove_user_by_name "$user_to_remove"
+        user_to_remove="${users_list[$((user_number-1))]}"
+        # Eliminar bloque location
+        sudo sed -i "/location \/${user_to_remove} {/,/}/d" /etc/nginx/nginx.conf
+        # Eliminar línea del archivo
+        sed -i "/^${user_to_remove}:/d" /etc/nginx/user_data.txt
+        
+        msg -verd "USUARIO ${user_to_remove} eliminado de nginx.conf."
 
         if sudo nginx -t > /dev/null 2>&1; then
           sudo systemctl restart nginx
@@ -323,122 +318,59 @@ remove_user() {
   done
 }
 
-# NUEVA FUNCIÓN: Editar usuario existente
+# Nueva función para editar la IP de un usuario
 edit_user() {
   clear
-  show_users
-  if [ ! -f /etc/nginx/user_data.txt ]; then
+  msg -bar
+  msg -verd "EDITAR IP (BACKEND) DE USUARIO"
+  msg -bar
+  # Asegurar que no hay expirados
+  check_expired_users
+
+  if [ ! -s /etc/nginx/user_data.txt ]; then
+    msg -verm "No hay usuarios activos para editar."
     return
   fi
 
-  local names=()
-  local ips=()
-  local exps=()
+  # Mostrar lista numerada de usuarios activos
+  echo -e "\e[1;36mUsuarios disponibles:\e[0m"
+  local users_list=()
+  local i=1
   while IFS=: read -r name ip exp; do
-    names+=("$name")
-    ips+=("$ip")
-    exps+=("$exp")
+    echo -e "\e[1;32m[$i]\e[0m \e[1;37m$name\e[0m - IP actual: \e[1;33m$ip\e[0m"
+    users_list+=("$name:$ip:$exp")
+    ((i++))
   done < /etc/nginx/user_data.txt
 
-  local total=${#names[@]}
-  if [ $total -eq 0 ]; then
-    msg -verm "No hay usuarios para editar."
-    return
-  fi
-
+  msg -bar
   read -p "Selecciona el número del usuario a editar: " user_number
-  if [[ ! "$user_number" =~ ^[0-9]+$ ]] || [ "$user_number" -lt 1 ] || [ "$user_number" -gt "$total" ]; then
+  if [[ ! "$user_number" =~ ^[0-9]+$ ]] || [ "$user_number" -lt 1 ] || [ "$user_number" -gt ${#users_list[@]} ]; then
     msg -verm "Número inválido."
     return
   fi
 
-  local idx=$((user_number-1))
-  local old_name="${names[$idx]}"
-  local old_ip="${ips[$idx]}"
-  local old_exp="${exps[$idx]}"
-  local old_days=$(( (old_exp - $(date +%s)) / 86400 ))
-
-  clear
-  msg -bar
-  msg -verd "EDITANDO USUARIO: ${old_name}"
-  msg -bar
-  echo -e "IP actual: ${old_ip}"
-  echo -e "Días restantes actuales: ${old_days}"
-  msg -bar
-  echo "¿Qué deseas modificar?"
-  echo "1) Nombre"
-  echo "2) IP"
-  echo "3) Días de expiración"
-  echo "4) Todos los campos"
-  read -p "Opción: " opt
-
-  local new_name="$old_name"
-  local new_ip="$old_ip"
-  local new_days="$old_days"
-
-  case $opt in
-    1)
-      read -p "Nuevo nombre (dejar vacío para no cambiar): " aux
-      if [ -n "$aux" ]; then
-        new_name=$(echo "$aux" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-        if grep -q "^${new_name}:" /etc/nginx/user_data.txt && [ "$new_name" != "$old_name" ]; then
-          msg -verm "El nombre ${new_name} ya existe. No se cambiará."
-          new_name="$old_name"
-        fi
-      fi
-      ;;
-    2)
-      read -p "Nueva IP (dejar vacío para no cambiar): " aux
-      [ -n "$aux" ] && new_ip="$aux"
-      ;;
-    3)
-      read -p "Nuevos días de expiración (número): " aux
-      if [[ "$aux" =~ ^[0-9]+$ ]]; then
-        new_days="$aux"
-      else
-        msg -verm "Días no válidos. Se mantienen los actuales."
-      fi
-      ;;
-    4)
-      read -p "Nuevo nombre (dejar vacío para no cambiar): " aux
-      if [ -n "$aux" ]; then
-        new_name=$(echo "$aux" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-        if grep -q "^${new_name}:" /etc/nginx/user_data.txt && [ "$new_name" != "$old_name" ]; then
-          msg -verm "El nombre ${new_name} ya existe. Se mantiene el original."
-          new_name="$old_name"
-        fi
-      fi
-      read -p "Nueva IP (dejar vacío para no cambiar): " aux
-      [ -n "$aux" ] && new_ip="$aux"
-      read -p "Nuevos días de expiración (número): " aux
-      if [[ "$aux" =~ ^[0-9]+$ ]]; then
-        new_days="$aux"
-      else
-        msg -verm "Días no válidos. Se mantienen los actuales."
-      fi
-      ;;
-    *)
-      msg -verm "Opción inválida. Volviendo al menú."
-      return
-      ;;
-  esac
-
-  # Si no hay cambios reales, salir
-  if [ "$new_name" == "$old_name" ] && [ "$new_ip" == "$old_ip" ] && [ "$new_days" == "$old_days" ]; then
-    msg -ama "No se realizaron cambios."
+  IFS=':' read -r old_name old_ip old_exp <<< "${users_list[$((user_number-1))]}"
+  read -p "Nueva IP para $old_name (actual: $old_ip): " new_ip
+  if [ -z "$new_ip" ]; then
+    msg -verm "No se ha cambiado la IP."
     return
   fi
 
-  # Eliminar el usuario antiguo
-  _remove_user_by_name "$old_name"
-  # Agregar con los nuevos datos
-  _add_user_to_config "$new_name" "$new_ip" "$new_days"
+  # Actualizar en nginx.conf: cambiar proxy_pass dentro del bloque location /$old_name
+  sudo sed -i "/location \/${old_name} {/,/}/ s|proxy_pass http://[^:]*:80;|proxy_pass http://${new_ip}:80;|" /etc/nginx/nginx.conf
+
+  # Actualizar en user_data.txt
+  sed -i "s/^${old_name}:${old_ip}:${old_exp}/${old_name}:${new_ip}:${old_exp}/" /etc/nginx/user_data.txt
+
+  msg -verd "IP de $old_name actualizada a $new_ip"
 
   if sudo nginx -t > /dev/null 2>&1; then
     sudo systemctl restart nginx
     msg -verd "Nginx reiniciado con éxito."
+  else
+    msg -verm "Error en la configuración de Nginx. Revisa manualmente."
   fi
-  msg -verd "Usuario editado correctamente."
+  msg -bar
 }
 
 check_nginx_status() {
@@ -501,12 +433,11 @@ show_instructions() {
     echo -e "       Connection: Upgrade[lf]"
     echo -e "       Upgrade: Websocket[lf][lf]\033[0m"
     echo -e "   🔹 FUNCIONA IGUAL QUE EL PAYLOAD DE CLARO."
-
+    
     echo -e "\033[1;36mPASO 6:\033[0m REEMPLAZAR 'sub' CON SU DOMINIO CLOUDFRONT."
     msg -bar
 }
 
-# Desinstalar nginx
 uninstall_nginx() {
   sudo apt purge nginx nginx-common -y
   sudo apt autoremove -y
@@ -514,29 +445,27 @@ uninstall_nginx() {
   msg -verd "Nginx desinstalado y nginx.conf eliminado."
 }
 
-# ================= MENÚ PRINCIPAL =================
+# Al iniciar el script, eliminar usuarios expirados automáticamente
+check_expired_users
 
 while true; do
-    # Verificar y eliminar usuarios expirados automáticamente (bloqueo de IP)
-    check_and_remove_expired_users
-
     clear
     echo -e "\033[0;34m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
     echo -e "\E[41;1;37m                CLOUDFRONT BACKEND                 \E[0m"
     echo -e "\033[0;34m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
-    msg -verd "MENÚ NGINX (V2 - CON EDICIÓN Y BLOQUEO AUTOMÁTICO)"
+    msg -verd "MENÚ NGINX (V2 - Autoeliminación + Edición)"
     check_nginx_status 
 
     echo -e "\033[0;34m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
     echo -e "\033[0;32m [\033[0;36m01\033[0;32m]\033[0;33m >\033[0;36m INSTALAR Y REINICIAR NGINX"
     echo -e "\033[0;32m [\033[0;36m02\033[0;32m]\033[0;33m >\033[0;36m AÑADIR USUARIO"
     echo -e "\033[0;32m [\033[0;36m03\033[0;32m]\033[0;33m >\033[0;36m MOSTRAR USUARIOS REGISTRADOS"
-    echo -e "\033[0;32m [\033[0;36m04\033[0;32m]\033[0;33m >\033[0;36m ELIMINAR USUARIO"
-    echo -e "\033[0;32m [\033[0;36m09\033[0;32m]\033[0;33m >\033[0;36m EDITAR USUARIO"
+    echo -e "\033[0;32m [\033[0;36m04\033[0;32m]\033[0;33m >\033[0;36m ELIMINAR USUARIO (MANUAL)"
     echo -e "\033[0;32m [\033[0;36m05\033[0;32m]\033[0;33m >\033[0;31m DESINSTALAR NGINX"
     echo -e "\033[0;32m [\033[0;36m06\033[0;32m]\033[0;33m >\033[0;36m PROXY PYTHON"
     echo -e "\033[0;32m [\033[0;36m07\033[0;32m]\033[0;33m >\033[0;36m INSTRUCCIONES DE CONFIGURACIÓN"
-    echo -e "\033[0;32m [\033[0;36m08\033[0;32m]\033[0;33m >\033[0;36m SALIR"
+    echo -e "\033[0;32m [\033[0;36m08\033[0;32m]\033[0;33m >\033[0;36m EDITAR USUARIO (IP)"
+    echo -e "\033[0;32m [\033[0;36m09\033[0;32m]\033[0;33m >\033[0;36m SALIR"
     echo -e "\033[0;34m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
 
     read -p "SELECCIONA UNA OPCIÓN: " choice
@@ -546,11 +475,11 @@ while true; do
         2) add_user ;;
         3) show_users ;;
         4) remove_user ;;
-        9) edit_user ;;
         5) uninstall_nginx ;;
         6) iniciarsocks ;;
         7) show_instructions ;;
-        8) exit 0 ;;
+        8) edit_user ;;
+        9) exit 0 ;;
         *) msg -verm "OPCIÓN NO VÁLIDA. POR FAVOR, INTENTA DE NUEVO." ;;
     esac
 
